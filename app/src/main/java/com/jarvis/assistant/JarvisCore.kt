@@ -8,6 +8,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Path
 import android.media.AudioManager
@@ -26,8 +27,8 @@ import android.view.accessibility.AccessibilityNodeInfo
 import java.util.Locale
 
 /**
- * Сервис специальных возможностей: видит экран,
- * нажимает кнопки и выполняет свайпы в любом приложении.
+ * Сервис специальных возможностей: умеет "видеть" экран,
+ * нажимать на кнопки и выполнять свайпы в любом приложении.
  */
 class JarvisAccessibilityService : AccessibilityService() {
 
@@ -100,6 +101,7 @@ class JarvisAccessibilityService : AccessibilityService() {
             val node = findNode(root, keywords)
             val clicked = node?.performAction(AccessibilityNodeInfo.ACTION_CLICK) ?: false
             if (!clicked) {
+                // запасной вариант: тап по координатам в правой части экрана
                 tap(0.90f, 0.63f)
                 true
             } else true
@@ -130,26 +132,42 @@ class JarvisAccessibilityService : AccessibilityService() {
 
 /**
  * Разбирает распознанную команду и выполняет действие.
+ * Умеет открывать ЛЮБОЕ установленное приложение: сначала ищет
+ * по псевдонимам, потом — по названиям всех приложений на телефоне.
  */
 object CommandProcessor {
 
     private val handler = Handler(Looper.getMainLooper())
 
-    private val apps = linkedMapOf(
+    /** Псевдонимы: что сказал пользователь -> package. Оба алфавита. */
+    private val aliases = linkedMapOf(
         "тик ток" to "com.zhiliaoapp.musically",
         "тикток" to "com.zhiliaoapp.musically",
+        "тик-ток" to "com.zhiliaoapp.musically",
+        "tik tok" to "com.zhiliaoapp.musically",
+        "tiktok" to "com.zhiliaoapp.musically",
         "ютуб" to "com.google.android.youtube",
         "ютубе" to "com.google.android.youtube",
         "youtube" to "com.google.android.youtube",
+        "you tube" to "com.google.android.youtube",
         "телеграм" to "org.telegram.messenger",
+        "telegram" to "org.telegram.messenger",
         "whatsapp" to "com.whatsapp",
         "ватсап" to "com.whatsapp",
+        "вотсап" to "com.whatsapp",
         "инстаграм" to "com.instagram.android",
+        "instagram" to "com.instagram.android",
         "вконтакте" to "com.vkontakte.android",
         "вк" to "com.vkontakte.android",
+        "vk" to "com.vkontakte.android",
+        "одноклассники" to "ru.ok.android",
         "хром" to "com.android.chrome",
         "chrome" to "com.android.chrome",
+        "браузер" to "com.android.chrome",
         "спотифай" to "com.spotify.music",
+        "spotify" to "com.spotify.music",
+        "яндекс музыку" to "ru.yandex.music",
+        "яндекс музыка" to "ru.yandex.music",
         "калькулятор" to "com.google.android.calculator",
         "настройки" to "com.android.settings",
         "камера" to "com.android.camera2",
@@ -157,25 +175,49 @@ object CommandProcessor {
         "почта" to "com.google.android.gm",
         "gmail" to "com.google.android.gm",
         "карты" to "com.google.android.apps.maps",
-        "музыка" to "com.google.android.apps.youtube.music"
+        "гугл карты" to "com.google.android.apps.maps",
+        "яндекс карты" to "ru.yandex.yandexmaps",
+        "музыка" to "com.google.android.apps.youtube.music",
+        "звонилку" to "com.google.android.dialer",
+        "звонки" to "com.google.android.dialer",
+        "контакты" to "com.google.android.contacts",
+        "галерею" to "com.google.android.apps.photos",
+        "галерея" to "com.google.android.apps.photos",
+        "часы" to "com.google.android.deskclock",
+        "будильник" to "com.google.android.deskclock",
+        "плей маркет" to "com.android.vending",
+        "play market" to "com.android.vending",
+        "гугл диск" to "com.google.android.apps.docs"
+    )
+
+    /** Запасные пакеты (TikTok Lite, Telegram Web и т.п.). */
+    private val fallbackPackages = mapOf(
+        "com.zhiliaoapp.musically" to listOf("com.zhiliaoapp.musically.go"),
+        "org.telegram.messenger" to listOf(
+            "org.telegram.messenger.web",
+            "com.telegram.web",
+            "org.thunderdog.challegram"
+        ),
+        "com.android.chrome" to listOf("org.mozilla.firefox", "com.opera.browser", "com.yandex.browser")
     )
 
     fun execute(context: android.content.Context, rawText: String) {
         val t = rawText.lowercase()
             .replace("джарвис", "")
             .replace("пожалуйста", "")
+            .replace("ё", "е")
             .trim()
 
         when {
             t.contains("лайк") || t.contains("нравится") || t.contains("like") -> {
                 JarvisAccessibilityService.like()
-                if (t.contains("листай") || t.contains("следующ") || t.contains("дальше") || t.contains("вперёд") || t.contains("вперед")) {
+                if (t.contains("листай") || t.contains("следующ") || t.contains("дальше") || t.contains("вперед")) {
                     handler.postDelayed({ JarvisAccessibilityService.swipeNext() }, 900)
                 }
             }
 
             t.contains("следующ") || t.contains("листай") ||
-                t.contains("дальше") || t.contains("вперёд") || t.contains("вперед") ||
+                t.contains("дальше") || t.contains("вперед") ||
                 t.contains("скролл") || t.contains("листни") -> {
                 JarvisAccessibilityService.swipeNext()
             }
@@ -185,7 +227,7 @@ object CommandProcessor {
             }
 
             t.contains("домой") || t.contains("на главный") || t.contains("на главную") ||
-                t.contains("дом") -> {
+                t == "дом" -> {
                 JarvisAccessibilityService.goHome()
             }
 
@@ -193,21 +235,91 @@ object CommandProcessor {
                 JarvisAccessibilityService.goBack()
             }
 
-            t.contains("открой") || t.contains("запусти") || t.contains("включи") -> {
-                openApp(context, t)
-            }
-
             else -> {
+                // Любая другая команда: считаем, что это «открой <что-то>»
                 openApp(context, t)
             }
         }
     }
 
     private fun openApp(context: android.content.Context, command: String) {
-        val entry = apps.entries.firstOrNull { command.contains(it.key) } ?: return
-        val launchIntent = context.packageManager.getLaunchIntentForPackage(entry.value)
-        launchIntent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        launchIntent?.let { context.startActivity(it) }
+        val q = command
+            .replace("откройте", "").replace("открой", "").replace("открыть", "")
+            .replace("запустите", "").replace("запусти", "").replace("запустить", "")
+            .replace("включи", "").replace("включить", "")
+            .replace("зайди в", "").replace("зайти в", "")
+            .trim()
+
+        if (q.isEmpty()) {
+            toast(context, "Не расслышал, что открыть")
+            return
+        }
+
+        // 1. Ищем по псевдонимам
+        var pkg: String? = aliases.entries.firstOrNull { q.contains(it.key) }?.value
+
+        // 2. Универсальный поиск по названиям установленных приложений
+        if (pkg == null) {
+            pkg = findByLabel(context, q)
+        }
+
+        if (pkg == null) {
+            toast(context, "Не нашел приложение: " + q)
+            return
+        }
+
+        val pm = context.packageManager
+        var launchIntent = pm.getLaunchIntentForPackage(pkg)
+        if (launchIntent == null) {
+            for (alt in fallbackPackages[pkg].orEmpty()) {
+                launchIntent = pm.getLaunchIntentForPackage(alt)
+                if (launchIntent != null) break
+            }
+        }
+        if (launchIntent == null) {
+            toast(context, "Приложение не установлено: " + q)
+            return
+        }
+        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(launchIntent)
+    }
+
+    /** Ищет приложение по названию среди всех установленных. */
+    private fun findByLabel(context: android.content.Context, query: String): String? {
+        val pm = context.packageManager
+        val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val activities = if (Build.VERSION.SDK_INT >= 33) {
+            pm.queryIntentActivities(mainIntent, PackageManager.ResolveInfoFlags.of(0))
+        } else {
+            @Suppress("DEPRECATION")
+            pm.queryIntentActivities(mainIntent, 0)
+        }
+        val qWords = query.split(Regex("[^a-zа-я0-9]+"))
+            .filter { it.length > 1 }
+        if (qWords.isEmpty()) return null
+
+        var best: String? = null
+        var bestScore = 0
+        for (info in activities) {
+            val label = info.loadLabel(pm).toString().lowercase().replace("ё", "е")
+            if (label.isEmpty()) continue
+            if (label.contains(query)) return info.activityInfo.packageName
+            val score = qWords.count { label.contains(it) }
+            if (score > bestScore) {
+                bestScore = score
+                best = info.activityInfo.packageName
+            }
+        }
+        return if (bestScore >= qWords.size) best else null
+    }
+
+    private fun toast(context: android.content.Context, msg: String) {
+        handler.post {
+            android.widget.Toast.makeText(
+                context, "Джарвис: " + msg,
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+        }
     }
 }
 
