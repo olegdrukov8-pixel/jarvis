@@ -28,7 +28,7 @@ import java.util.Locale
 
 /**
  * Сервис специальных возможностей: умеет "видеть" экран,
- * нажимать на кнопки и выполнять свайпы в любом приложении.
+ * нажимать на кнопки, вводить текст и выполнять свайпы в любом приложении.
  */
 class JarvisAccessibilityService : AccessibilityService() {
 
@@ -57,6 +57,26 @@ class JarvisAccessibilityService : AccessibilityService() {
                 val clicked = s.clickByKeywords(listOf("like", "нравится", "лайк"))
                 if (!clicked) {
                     handler.postDelayed({ s.tap(0.90f, 0.63f) }, 300)
+                }
+            }
+        }
+
+        /** Вводит текст в сфокусированное поле ввода (команда "напиши ..."). */
+        fun typeText(text: String) {
+            val s = instance ?: return
+            handler.post {
+                val root = s.rootInActiveWindow ?: return@post
+                val target = s.findFocusedEditable(root)
+                if (target != null) {
+                    val args = Bundle()
+                    args.putCharSequence(
+                        AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                        text
+                    )
+                    target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                } else {
+                    s.tap(0.5f, 0.5f)
+                    handler.postDelayed({ typeText(text) }, 500)
                 }
             }
         }
@@ -124,6 +144,19 @@ class JarvisAccessibilityService : AccessibilityService() {
         }
         for (i in 0 until node.childCount) {
             val found = findNode(node.getChild(i), keywords)
+            if (found != null) return found
+        }
+        return null
+    }
+
+    private fun findFocusedEditable(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        if (node == null) return null
+        if (node.isFocused && (node.isEditable ||
+                node.className?.toString()?.contains("EditText") == true)) {
+            return node
+        }
+        for (i in 0 until node.childCount) {
+            val found = findFocusedEditable(node.getChild(i))
             if (found != null) return found
         }
         return null
@@ -209,6 +242,17 @@ object CommandProcessor {
             .trim()
 
         when {
+            t.startsWith("напиши") || t.startsWith("набери") || t.startsWith("напечатай") -> {
+                val text = t
+                    .removePrefix("напиши").removePrefix("набери").removePrefix("напечатай")
+                    .trim()
+                if (text.isNotEmpty()) {
+                    JarvisAccessibilityService.typeText(text)
+                } else {
+                    toast(context, "Не расслышал, что написать")
+                }
+            }
+
             t.contains("лайк") || t.contains("нравится") || t.contains("like") -> {
                 JarvisAccessibilityService.like()
                 if (t.contains("листай") || t.contains("следующ") || t.contains("дальше") || t.contains("вперед")) {
@@ -325,7 +369,8 @@ object CommandProcessor {
 
 /**
  * Фоновый сервис: постоянно слушает микрофон.
- * Услышал "джарвис" -> режим команды -> выполнил -> снова слушает.
+ * Команда говорится в одном предложении со словом "джарвис":
+ * "джарвис открой тик ток". Выполняет, только когда фраза закончена.
  */
 class VoiceService : Service() {
 
@@ -334,8 +379,6 @@ class VoiceService : Service() {
         const val NOTIF_ID = 1
         const val ACTION_START = "com.jarvis.assistant.START"
         const val ACTION_STOP = "com.jarvis.assistant.STOP"
-        private const val STATE_WAKE = 0
-        private const val STATE_COMMAND = 1
 
         @Volatile
         var isRunning: Boolean = false
@@ -345,9 +388,9 @@ class VoiceService : Service() {
     private lateinit var recognizer: SpeechRecognizer
     private var tts: TextToSpeech? = null
     private val handler = Handler(Looper.getMainLooper())
-    private var state = STATE_WAKE
     private var running = false
     private var tone: ToneGenerator? = null
+    private var beeped = false
 
     override fun onCreate() {
         super.onCreate()
@@ -402,7 +445,7 @@ class VoiceService : Service() {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1200L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 800L)
         }
         try {
             recognizer.startListening(intent)
@@ -419,7 +462,9 @@ class VoiceService : Service() {
 
         override fun onReadyForSpeech(params: Bundle?) {}
 
-        override fun onBeginningOfSpeech() {}
+        override fun onBeginningOfSpeech() {
+            beeped = false
+        }
 
         override fun onRmsChanged(rmsdB: Float) {}
 
@@ -428,43 +473,43 @@ class VoiceService : Service() {
         override fun onEndOfSpeech() {}
 
         override fun onError(error: Int) {
-            if (state == STATE_COMMAND && error == SpeechRecognizer.ERROR_NO_MATCH) {
-                state = STATE_WAKE
-                updateNotification("Джарвис слушает...")
-            }
+            beeped = false
             restart(700)
         }
 
         override fun onPartialResults(partialResults: Bundle?) {
-            if (state != STATE_WAKE) return
+            if (beeped) return
             val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 ?: return
-            val heardJarvis = matches.any { it.lowercase().contains("джарвис") }
-            if (heardJarvis) {
-                state = STATE_COMMAND
+            if (matches.any { it.lowercase().contains("джарвис") }) {
+                beeped = true
                 tone?.startTone(ToneGenerator.TONE_PROP_ACK, 180)
                 updateNotification("Говорите команду...")
-                try {
-                    recognizer.stopListening()
-                } catch (e: Exception) {
-                }
-                restart(250)
             }
         }
 
         override fun onResults(results: Bundle?) {
+            beeped = false
             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            if (state == STATE_COMMAND && !matches.isNullOrEmpty()) {
-                val command = matches[0]
-                updateNotification("Команда: " + command)
-                CommandProcessor.execute(this@VoiceService, command)
-                try {
-                    tts?.speak("Выполняю", TextToSpeech.QUEUE_FLUSH, null, "jarvis_ok")
-                } catch (e: Exception) {
+            if (!matches.isNullOrEmpty()) {
+                val heard = matches[0].lowercase()
+                if (heard.contains("джарвис")) {
+                    val command = heard
+                        .replace("джарвис", " ")
+                        .replace(Regex("[^a-zа-я0-9 ]"), " ")
+                        .replace(Regex("\\s+"), " ")
+                        .trim()
+                    if (command.isNotEmpty()) {
+                        updateNotification("Команда: " + command)
+                        CommandProcessor.execute(this@VoiceService, command)
+                        try {
+                            tts?.speak("Выполняю", TextToSpeech.QUEUE_FLUSH, null, "jarvis_ok")
+                        } catch (e: Exception) {
+                        }
+                    }
                 }
-                state = STATE_WAKE
-                updateNotification("Джарвис слушает...")
             }
+            updateNotification("Джарвис слушает...")
             restart(500)
         }
 
