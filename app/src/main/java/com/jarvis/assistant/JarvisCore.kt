@@ -7,6 +7,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
@@ -26,9 +27,47 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import java.util.Locale
 
+/** Озвучка ответов Джарвиса. */
+object Speaker {
+    private var tts: TextToSpeech? = null
+    private var ready = false
+
+    fun init(context: Context) {
+        if (tts != null) return
+        try {
+            tts = TextToSpeech(context.applicationContext) { status ->
+                ready = status == TextToSpeech.SUCCESS
+                if (ready) {
+                    tts?.language = Locale("ru")
+                }
+            }
+        } catch (e: Exception) {
+            tts = null
+        }
+    }
+
+    fun say(text: String) {
+        if (!ready) return
+        try {
+            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "jarvis_" + System.nanoTime())
+        } catch (e: Exception) {
+        }
+    }
+
+    fun shutdown() {
+        ready = false
+        try {
+            tts?.stop()
+            tts?.shutdown()
+        } catch (e: Exception) {
+        }
+        tts = null
+    }
+}
+
 /**
- * Сервис специальных возможностей: умеет "видеть" экран,
- * нажимать на кнопки, вводить текст и выполнять свайпы в любом приложении.
+ * Сервис специальных возможностей: видит экран, нажимает кнопки,
+ * вводит текст, открывает чаты и выполняет свайпы в любом приложении.
  */
 class JarvisAccessibilityService : AccessibilityService() {
 
@@ -38,21 +77,34 @@ class JarvisAccessibilityService : AccessibilityService() {
 
         fun isEnabled(): Boolean = instance != null
 
-        /** Свайп вверх — следующее видео (TikTok, Shorts, Reels). */
-        fun swipeNext() { instance?.swipe(0.5f, 0.72f, 0.5f, 0.28f, 320) }
+        fun swipeNext() {
+            instance ?: return
+            Speaker.say(pick(swipePhrases))
+            instance?.swipe(0.5f, 0.72f, 0.5f, 0.28f, 320)
+        }
 
-        /** Свайп вниз — предыдущее видео. */
-        fun swipePrev() { instance?.swipe(0.5f, 0.28f, 0.5f, 0.72f, 320) }
+        fun swipePrev() {
+            instance ?: return
+            Speaker.say("Возвращаю предыдущее")
+            instance?.swipe(0.5f, 0.28f, 0.5f, 0.72f, 320)
+        }
 
-        fun goHome() { instance?.performGlobalAction(GLOBAL_ACTION_HOME) }
-        fun goBack() { instance?.performGlobalAction(GLOBAL_ACTION_BACK) }
+        fun goHome() {
+            instance ?: return
+            Speaker.say("Возвращаюсь на главный экран")
+            instance?.performGlobalAction(GLOBAL_ACTION_HOME)
+        }
 
-        /**
-         * Ставит лайк: сначала ищет кнопку по тексту (Like/Нравится/лайк),
-         * если не нашёл — тапает по типичным координатам кнопки лайка TikTok.
-         */
+        fun goBack() {
+            instance ?: return
+            Speaker.say("Назад")
+            instance?.performGlobalAction(GLOBAL_ACTION_BACK)
+        }
+
+        /** Лайк: ищет кнопку по тексту, иначе тапает по координатам TikTok. */
         fun like() {
             val s = instance ?: return
+            Speaker.say(pick(likePhrases))
             handler.post {
                 val clicked = s.clickByKeywords(listOf("like", "нравится", "лайк"))
                 if (!clicked) {
@@ -61,7 +113,7 @@ class JarvisAccessibilityService : AccessibilityService() {
             }
         }
 
-        /** Вводит текст в сфокусированное поле ввода (команда "напиши ..."). */
+        /** Вводит текст в сфокусированное поле ввода. */
         fun typeText(text: String) {
             val s = instance ?: return
             handler.post {
@@ -74,11 +126,111 @@ class JarvisAccessibilityService : AccessibilityService() {
                         text
                     )
                     target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                    Speaker.say("Написал: " + text)
                 } else {
                     s.tap(0.5f, 0.5f)
                     handler.postDelayed({ typeText(text) }, 500)
                 }
             }
+        }
+
+        /** Открывает чат по имени. Несколько совпадений -> просит уточнить. */
+        fun openChat(name: String) {
+            val s = instance ?: return
+            val clean = name.trim().lowercase()
+            if (clean.isEmpty()) {
+                Speaker.say("Не расслышал имя")
+                return
+            }
+            handler.post {
+                val root = s.rootInActiveWindow ?: return@post
+                val matches = mutableListOf<AccessibilityNodeInfo>()
+                s.findNodesByText(root, clean, matches)
+                val unique = matches.distinctBy {
+                    it.viewIdResourceName + "|" + (it.text ?: it.contentDescription ?: "")
+                }
+                when {
+                    unique.isEmpty() ->
+                        Speaker.say("Не нашёл чат с именем " + clean)
+                    unique.size > 1 ->
+                        Speaker.say("Нашёл несколько чатов с именем " + clean +
+                            ". Уточните фамилию или имя")
+                    else -> {
+                        unique[0].performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                        Speaker.say("Открываю чат с " + clean)
+                    }
+                }
+            }
+        }
+
+        /** Открывает поисковую строку. */
+        fun openSearch() {
+            clickByLabels(
+                listOf("поиск", "search", "найти"),
+                "Открываю поиск",
+                "Не нашёл строку поиска"
+            )
+        }
+
+        /** Жмёт кнопку отправки сообщения. */
+        fun pressSend() {
+            clickByLabels(
+                listOf("отправить", "send"),
+                "Отправляю",
+                "Не нашёл кнопку отправки"
+            )
+        }
+
+        /** Открывает вкладку (профиль, входящие, главная...). */
+        fun openTab(tab: String) {
+            val keywords = when {
+                tab.contains("входящ") || tab.contains("inbox") ->
+                    listOf("входящие", "уведомления", "inbox")
+                tab.contains("профил") || tab.contains("profile") ->
+                    listOf("профиль", "profile")
+                tab.contains("главн") || tab.contains("home") || tab.contains("дом") ->
+                    listOf("главная", "home")
+                tab.contains("друз") -> listOf("друзья", "friends")
+                tab.contains("рекоменда") || tab.contains("интересн") ->
+                    listOf("интересное", "discover", "рекомендации")
+                else -> listOf(tab)
+            }
+            clickByLabels(keywords, "Открываю вкладку", "Не нашёл такую вкладку")
+        }
+
+        private fun clickByLabels(
+            keywords: List<String>,
+            doing: String,
+            failMsg: String
+        ) {
+            val s = instance ?: return
+            handler.post {
+                val root = s.rootInActiveWindow ?: return@post
+                for (kw in keywords) {
+                    val matches = mutableListOf<AccessibilityNodeInfo>()
+                    s.findNodesByText(root, kw, matches)
+                    val target = matches.firstOrNull { it.isClickable } ?: matches.firstOrNull()
+                    if (target != null) {
+                        target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                        Speaker.say(doing)
+                        return@post
+                    }
+                }
+                Speaker.say(failMsg)
+            }
+        }
+
+        private val swipePhrases = listOf(
+            "Листаю", "Следующее", "Прокручиваю ленту"
+        )
+        private val likePhrases = listOf(
+            "Ставлю лайк",
+            "Лайк поставлен. Надеюсь, видео того стоило",
+            "Отмечаю как понравившееся"
+        )
+
+        fun pick(list: List<String>): String {
+            return list[kotlin.random.Random.nextInt(list.size)]
         }
     }
 
@@ -114,14 +266,12 @@ class JarvisAccessibilityService : AccessibilityService() {
         dispatchGesture(gesture, null, null)
     }
 
-    /** Ищет на экране элемент, чей текст содержит одно из слов, и нажимает его. */
     private fun clickByKeywords(keywords: List<String>): Boolean {
         val root = rootInActiveWindow ?: return false
         return try {
             val node = findNode(root, keywords)
             val clicked = node?.performAction(AccessibilityNodeInfo.ACTION_CLICK) ?: false
             if (!clicked) {
-                // запасной вариант: тап по координатам в правой части экрана
                 tap(0.90f, 0.63f)
                 true
             } else true
@@ -149,6 +299,27 @@ class JarvisAccessibilityService : AccessibilityService() {
         return null
     }
 
+    private fun findNodesByText(
+        node: AccessibilityNodeInfo?,
+        text: String,
+        out: MutableList<AccessibilityNodeInfo>
+    ) {
+        if (node == null) return
+        val label = (node.text ?: node.contentDescription)?.toString()?.lowercase()
+        if (label != null && label.contains(text)) {
+            var target: AccessibilityNodeInfo? = node
+            var hops = 0
+            while (target != null && !target.isClickable && hops < 6) {
+                target = target.parent
+                hops++
+            }
+            if (target != null) out.add(target)
+        }
+        for (i in 0 until node.childCount) {
+            findNodesByText(node.getChild(i), text, out)
+        }
+    }
+
     private fun findFocusedEditable(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
         if (node == null) return null
         if (node.isFocused && (node.isEditable ||
@@ -164,15 +335,13 @@ class JarvisAccessibilityService : AccessibilityService() {
 }
 
 /**
- * Разбирает распознанную команду и выполняет действие.
- * Умеет открывать ЛЮБОЕ установленное приложение: сначала ищет
- * по псевдонимам, потом — по названиям всех приложений на телефоне.
+ * Разбирает команды, отвечает фразами, открывает приложения,
+ * чаты, вкладки, поиск; ставит лайки и листает ленту.
  */
 object CommandProcessor {
 
     private val handler = Handler(Looper.getMainLooper())
 
-    /** Псевдонимы: что сказал пользователь -> package. Оба алфавита. */
     private val aliases = linkedMapOf(
         "тик ток" to "com.zhiliaoapp.musically",
         "тикток" to "com.zhiliaoapp.musically",
@@ -223,7 +392,6 @@ object CommandProcessor {
         "гугл диск" to "com.google.android.apps.docs"
     )
 
-    /** Запасные пакеты (TikTok Lite, Telegram Web и т.п.). */
     private val fallbackPackages = mapOf(
         "com.zhiliaoapp.musically" to listOf("com.zhiliaoapp.musically.go"),
         "org.telegram.messenger" to listOf(
@@ -231,17 +399,61 @@ object CommandProcessor {
             "com.telegram.web",
             "org.thunderdog.challegram"
         ),
-        "com.android.chrome" to listOf("org.mozilla.firefox", "com.opera.browser", "com.yandex.browser")
+        "com.android.chrome" to listOf(
+            "org.mozilla.firefox", "com.opera.browser", "com.yandex.browser"
+        )
     )
 
-    fun execute(context: android.content.Context, rawText: String) {
+    private val openPhrases = listOf(
+        "Открываю", "Уже открываю", "Сделано, сэр",
+        "К вашим услугам. Открываю", "Секунду — открываю"
+    )
+    private val greetPhrases = listOf(
+        "Привет! Чем займёмся?", "Здравствуйте. Я к вашим услугам",
+        "Привет! Слушаю вас"
+    )
+    private val howAreYou = listOf(
+        "Работаю без сбоев, спасибо, что спросили",
+        "Все системы в норме. Как ваши дела?",
+        "Отлично! Микрофон чистый, память свободна. Можно захватывать мир"
+    )
+    private val whoAreYou = listOf(
+        "Я Джарвис — ваш голосовой помощник. Версия три ноль",
+        "Джарвис, к вашим услугам. Ну, почти тот самый из фильма"
+    )
+    private val youreWelcome = listOf(
+        "Всегда пожалуйста", "Обращайтесь", "Не стоит благодарности"
+    )
+    private val praiseReply = listOf(
+        "Стараюсь, сэр", "Спасибо! Это вдохновляет"
+    )
+    private val byeReply = listOf(
+        "До связи", "Всего доброго. Я тут, если что"
+    )
+
+    fun execute(context: Context, rawText: String) {
         val t = rawText.lowercase()
             .replace("джарвис", "")
             .replace("пожалуйста", "")
             .replace("ё", "е")
             .trim()
 
+        if (t.isEmpty()) return
+
+        // --- Разговор ---
+        val smalltalk = listOf(
+            "привет", "здравствуй", "добрый день", "доброе утро",
+            "добрый вечер", "как дела", "как ты", "как ваши дела",
+            "кто ты", "как тебя зовут", "спасибо", "благодарю",
+            "молодец", "молодцы", "пока", "до свидания"
+        )
+        if (t.length < 35 && smalltalk.any { t.contains(it) }) {
+            smalltalkReply(t)
+            return
+        }
+
         when {
+            // --- Написать текст ---
             t.startsWith("напиши") || t.startsWith("набери") || t.startsWith("напечатай") -> {
                 val text = t
                     .removePrefix("напиши").removePrefix("набери").removePrefix("напечатай")
@@ -249,13 +461,47 @@ object CommandProcessor {
                 if (text.isNotEmpty()) {
                     JarvisAccessibilityService.typeText(text)
                 } else {
-                    toast(context, "Не расслышал, что написать")
+                    Speaker.say("Не расслышал, что написать")
                 }
             }
 
+            // --- Отправить сообщение ---
+            t.contains("отправь") || t.contains("отправить") -> {
+                JarvisAccessibilityService.pressSend()
+            }
+
+            // --- Зайти в чат к кому-то ---
+            t.contains("чат") -> {
+                var name = afterWord(t, "чат")
+                name = name
+                    .removePrefix("к ").removePrefix("ко ")
+                    .removePrefix("с ").removePrefix("со ")
+                    .removePrefix("с именем ").removePrefix("имени ")
+                    .trim()
+                if (name.isNotEmpty()) {
+                    JarvisAccessibilityService.openChat(name)
+                } else {
+                    Speaker.say("Не расслышал, к кому зайти")
+                }
+            }
+
+            // --- Поисковая строка ---
+            t.contains("поиск") || t.contains("найти") -> {
+                JarvisAccessibilityService.openSearch()
+            }
+
+            // --- Вкладка ---
+            t.contains("вкладк") -> {
+                JarvisAccessibilityService.openTab(
+                    afterWord(t, "вкладку").ifEmpty { afterWord(t, "вкладка") }
+                )
+            }
+
+            // --- Лайк ---
             t.contains("лайк") || t.contains("нравится") || t.contains("like") -> {
                 JarvisAccessibilityService.like()
-                if (t.contains("листай") || t.contains("следующ") || t.contains("дальше") || t.contains("вперед")) {
+                if (t.contains("листай") || t.contains("следующ") ||
+                    t.contains("дальше") || t.contains("вперед")) {
                     handler.postDelayed({ JarvisAccessibilityService.swipeNext() }, 900)
                 }
             }
@@ -270,8 +516,8 @@ object CommandProcessor {
                 JarvisAccessibilityService.swipePrev()
             }
 
-            t.contains("домой") || t.contains("на главный") || t.contains("на главную") ||
-                t == "дом" -> {
+            t.contains("домой") || t.contains("на главный") ||
+                t.contains("на главную") || t == "дом" -> {
                 JarvisAccessibilityService.goHome()
             }
 
@@ -280,13 +526,34 @@ object CommandProcessor {
             }
 
             else -> {
-                // Любая другая команда: считаем, что это «открой <что-то>»
                 openApp(context, t)
             }
         }
     }
 
-    private fun openApp(context: android.content.Context, command: String) {
+    private fun smalltalkReply(t: String) {
+        when {
+            t.contains("как дела") || t.contains("как ты") || t.contains("как ваши дела") ->
+                Speaker.say(JarvisAccessibilityService.pick(howAreYou))
+            t.contains("кто ты") || t.contains("как тебя зовут") ->
+                Speaker.say(JarvisAccessibilityService.pick(whoAreYou))
+            t.contains("спасибо") || t.contains("благодарю") ->
+                Speaker.say(JarvisAccessibilityService.pick(youreWelcome))
+            t.contains("молодец") || t.contains("молодцы") ->
+                Speaker.say(JarvisAccessibilityService.pick(praiseReply))
+            t.contains("пока") || t.contains("до свидания") ->
+                Speaker.say(JarvisAccessibilityService.pick(byeReply))
+            else ->
+                Speaker.say(JarvisAccessibilityService.pick(greetPhrases))
+        }
+    }
+
+    private fun afterWord(t: String, word: String): String {
+        val i = t.indexOf(word)
+        return if (i >= 0) t.substring(i + word.length).trim() else ""
+    }
+
+    private fun openApp(context: Context, command: String) {
         val q = command
             .replace("откройте", "").replace("открой", "").replace("открыть", "")
             .replace("запустите", "").replace("запусти", "").replace("запустить", "")
@@ -295,20 +562,16 @@ object CommandProcessor {
             .trim()
 
         if (q.isEmpty()) {
-            toast(context, "Не расслышал, что открыть")
+            Speaker.say("Не расслышал, что открыть")
             return
         }
 
-        // 1. Ищем по псевдонимам
         var pkg: String? = aliases.entries.firstOrNull { q.contains(it.key) }?.value
-
-        // 2. Универсальный поиск по названиям установленных приложений
         if (pkg == null) {
             pkg = findByLabel(context, q)
         }
-
         if (pkg == null) {
-            toast(context, "Не нашел приложение: " + q)
+            Speaker.say("Не нашёл приложение " + q)
             return
         }
 
@@ -321,15 +584,15 @@ object CommandProcessor {
             }
         }
         if (launchIntent == null) {
-            toast(context, "Приложение не установлено: " + q)
+            Speaker.say("Приложение " + q + " не установлено")
             return
         }
         launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(launchIntent)
+        Speaker.say(JarvisAccessibilityService.pick(openPhrases))
     }
 
-    /** Ищет приложение по названию среди всех установленных. */
-    private fun findByLabel(context: android.content.Context, query: String): String? {
+    private fun findByLabel(context: Context, query: String): String? {
         val pm = context.packageManager
         val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val activities = if (Build.VERSION.SDK_INT >= 33) {
@@ -356,21 +619,11 @@ object CommandProcessor {
         }
         return if (bestScore >= qWords.size) best else null
     }
-
-    private fun toast(context: android.content.Context, msg: String) {
-        handler.post {
-            android.widget.Toast.makeText(
-                context, "Джарвис: " + msg,
-                android.widget.Toast.LENGTH_LONG
-            ).show()
-        }
-    }
 }
 
 /**
- * Фоновый сервис: постоянно слушает микрофон.
- * Команда говорится в одном предложении со словом "джарвис":
- * "джарвис открой тик ток". Выполняет, только когда фраза закончена.
+ * Фоновый сервис: слушает микрофон почти непрерывно
+ * (паузы между циклами ~0,3 секунды).
  */
 class VoiceService : Service() {
 
@@ -386,7 +639,6 @@ class VoiceService : Service() {
     }
 
     private lateinit var recognizer: SpeechRecognizer
-    private var tts: TextToSpeech? = null
     private val handler = Handler(Looper.getMainLooper())
     private var running = false
     private var tone: ToneGenerator? = null
@@ -394,16 +646,8 @@ class VoiceService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Speaker.init(this)
         createChannel()
-        try {
-            tts = TextToSpeech(this) { status ->
-                if (status == TextToSpeech.SUCCESS) {
-                    tts?.language = Locale("ru")
-                }
-            }
-        } catch (e: Exception) {
-            tts = null
-        }
         tone = try {
             ToneGenerator(AudioManager.STREAM_NOTIFICATION, 90)
         } catch (e: Exception) {
@@ -430,7 +674,7 @@ class VoiceService : Service() {
             } else {
                 startForeground(NOTIF_ID, notification)
             }
-            handler.postDelayed({ startListening() }, 400)
+            handler.postDelayed({ startListening() }, 300)
         }
         return START_STICKY
     }
@@ -450,7 +694,7 @@ class VoiceService : Service() {
         try {
             recognizer.startListening(intent)
         } catch (e: Exception) {
-            restart(1500)
+            restart(500)
         }
     }
 
@@ -474,7 +718,7 @@ class VoiceService : Service() {
 
         override fun onError(error: Int) {
             beeped = false
-            restart(700)
+            restart(300)
         }
 
         override fun onPartialResults(partialResults: Bundle?) {
@@ -502,15 +746,11 @@ class VoiceService : Service() {
                     if (command.isNotEmpty()) {
                         updateNotification("Команда: " + command)
                         CommandProcessor.execute(this@VoiceService, command)
-                        try {
-                            tts?.speak("Выполняю", TextToSpeech.QUEUE_FLUSH, null, "jarvis_ok")
-                        } catch (e: Exception) {
-                        }
                     }
                 }
             }
             updateNotification("Джарвис слушает...")
-            restart(500)
+            restart(300)
         }
 
         override fun onEvent(eventType: Int, params: Bundle?) {}
@@ -560,8 +800,7 @@ class VoiceService : Service() {
             recognizer.destroy()
         } catch (e: Exception) {
         }
-        tts?.stop()
-        tts?.shutdown()
+        Speaker.shutdown()
         tone?.release()
         super.onDestroy()
     }
