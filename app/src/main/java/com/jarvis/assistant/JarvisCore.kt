@@ -6,6 +6,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.SearchManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -14,6 +15,7 @@ import android.content.pm.ServiceInfo
 import android.graphics.Path
 import android.media.AudioManager
 import android.media.ToneGenerator
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -25,6 +27,7 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.net.URLEncoder
 import java.util.Locale
 
 /** Озвучка ответов Джарвиса. */
@@ -336,7 +339,7 @@ class JarvisAccessibilityService : AccessibilityService() {
 
 /**
  * Разбирает команды, отвечает фразами, открывает приложения,
- * чаты, вкладки, поиск; ставит лайки и листает ленту.
+ * чаты, вкладки, поиск; включает музыку, ставит лайки.
  */
 object CommandProcessor {
 
@@ -440,14 +443,19 @@ object CommandProcessor {
 
         if (t.isEmpty()) return
 
-        // --- Разговор ---
+        // --- Разговор (только если это не команда) ---
         val smalltalk = listOf(
             "привет", "здравствуй", "добрый день", "доброе утро",
             "добрый вечер", "как дела", "как ты", "как ваши дела",
             "кто ты", "как тебя зовут", "спасибо", "благодарю",
             "молодец", "молодцы", "пока", "до свидания"
         )
-        if (t.length < 35 && smalltalk.any { t.contains(it) }) {
+        val actionVerbs = listOf(
+            "напиши", "набери", "напечатай", "открой", "запусти",
+            "включи", "зайди", "поставь", "листай", "отправь", "поиск", "найди"
+        )
+        if (t.length < 35 && actionVerbs.none { t.startsWith(it) } &&
+            smalltalk.any { t.contains(it) }) {
             smalltalkReply(t)
             return
         }
@@ -485,9 +493,31 @@ object CommandProcessor {
                 }
             }
 
-            // --- Поисковая строка ---
+            // --- Поиск в Яндексе ---
+            t.startsWith("поиск") && afterWord(t, "поиск").isNotEmpty() -> {
+                webSearch(context, afterWord(t, "поиск"))
+            }
+
+            // --- Поисковая строка в приложении ---
             t.contains("поиск") || t.contains("найти") -> {
                 JarvisAccessibilityService.openSearch()
+            }
+
+            // --- Музыка ---
+            t.contains("музык") || t.contains("песн") || t.contains("трек") -> {
+                var mq = afterWord(t, "музыку")
+                    .ifEmpty { afterWord(t, "музыка") }
+                    .ifEmpty { afterWord(t, "песню") }
+                    .ifEmpty { afterWord(t, "песня") }
+                    .ifEmpty { afterWord(t, "трек") }
+                if (mq.isEmpty() && t.startsWith("включи")) {
+                    mq = afterWord(t, "включи")
+                }
+                if (mq.isNotEmpty()) {
+                    playMusic(context, mq)
+                } else {
+                    openApp(context, "музыка")
+                }
             }
 
             // --- Вкладка ---
@@ -527,6 +557,42 @@ object CommandProcessor {
 
             else -> {
                 openApp(context, t)
+            }
+        }
+    }
+
+    /** Поиск в Яндексе через браузер. */
+    private fun webSearch(context: Context, q: String) {
+        try {
+            val url = "https://yandex.ru/search/?text=" + URLEncoder.encode(q, "UTF-8")
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+            Speaker.say("Ищу в Яндексе: " + q)
+        } catch (e: Exception) {
+            Speaker.say("Не смог открыть поиск")
+        }
+    }
+
+    /** Включает музыку через системный intent (Яндекс Музыка, VK, YouTube, Spotify). */
+    private fun playMusic(context: Context, q: String) {
+        val intent = Intent("android.media.action.MEDIA_PLAY_FROM_SEARCH").apply {
+            putExtra(SearchManager.QUERY, q)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            context.startActivity(intent)
+            Speaker.say("Включаю: " + q)
+        } catch (e: Exception) {
+            try {
+                val url = "https://music.yandex.ru/search?text=" +
+                    URLEncoder.encode(q, "UTF-8")
+                val browser = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(browser)
+                Speaker.say("Открываю поиск музыки")
+            } catch (e2: Exception) {
+                Speaker.say("Не смог включить музыку")
             }
         }
     }
